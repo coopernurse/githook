@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 )
 
 //////////////////////////////
@@ -98,13 +99,19 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 	}
 
 	var cmd *exec.Cmd
+	var path string
+
+	if len(job.Script) > 0 {
+		path = strings.Replace(job.Script[0], "$dir", job.Dir, 1)
+	}
+
 	switch len(job.Script) {
 	case 0:
-		return logMsg(fmt.Sprint("ERROR script not defined for repository:", repoName, "-", job))
+		return logMsg(fmt.Sprint("ERROR script not defined for repository: ", repoName, "-", job))
 	case 1:
-		cmd = exec.Command(job.Script[0])
+		cmd = exec.Command(path)
 	default:
-		cmd = exec.Command(job.Script[0], job.Script[1:]...)
+		cmd = exec.Command(path, job.Script[1:]...)
 	}
 
 	if job.Dir != "" {
@@ -116,16 +123,18 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
+	log.Println("Running job for repository:", repoName, "dir:", cmd.Dir, "script:", cmd.Path)
 	err = cmd.Run()
 
 	var msg string
 	if err != nil {
-		msg = fmt.Sprint("ERROR Executing script for repository:", repoName, "-", job.Script,
-			"-", err, "stdout:", stdout.String(), "stderr:", stderr.String())
+		msg = fmt.Sprint("ERROR Executing script for repository:", repoName, "-", cmd.Path,
+			"-", err, " stdout: ", stdout.String(), " stderr: ", stderr.String())
 	} else {
 		msg = fmt.Sprint("OK ran job for repository:", repoName, "-", job.Script)
 	}
 
+	log.Println(msg)
 	return []byte(msg)
 }
 
