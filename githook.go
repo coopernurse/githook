@@ -1,19 +1,74 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/coopernurse/cmdlog"
+	"github.com/crowdmob/goamz/s3"
 	"github.com/karalabe/iris-go"
 	"io/ioutil"
 	"log"
+	"net/smtp"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 )
+
+type AwsConf struct {
+	Access string
+	Secret string
+	Bucket string
+	Region string
+	Acl    string
+}
+
+type EmailConf struct {
+	SmtpHost string
+	From     string
+	To       []string
+	Always   bool
+}
+
+type Config struct {
+	Repositories map[string]JobDef
+	Aws          AwsConf
+	Email        EmailConf
+}
+
+func (c Config) SMTPLogger() (cmdlog.SMTPLogger, bool) {
+	if c.Email.From != "" && len(c.Email.To) > 0 {
+		// TODO: support smtp auth
+		auth := smtp.CRAMMD5Auth("", "")
+
+		return cmdlog.SMTPLogger{
+			Host: c.Email.SmtpHost,
+			From: c.Email.From,
+			To:   c.Email.To,
+			Auth: &auth,
+		}, true
+	}
+	return cmdlog.SMTPLogger{}, false
+}
+
+func (c Config) S3Logger() (cmdlog.S3Logger, bool) {
+	if c.Aws.Access != "" && c.Aws.Secret != "" && c.Aws.Bucket != "" {
+		bucket, err := cmdlog.EnsureBucket(c.Aws.Access, c.Aws.Secret, c.Aws.Region, c.Aws.Bucket, s3.ACL(c.Aws.Acl))
+		if err != nil {
+			log.Println("ERROR S3Logger() cannot create bucket for: ", c.Aws, " err: ", err)
+		} else {
+			return cmdlog.S3Logger{
+				Bucket:      bucket,
+				Perm:        s3.PublicRead,
+				Options:     s3.Options{},
+				ContentType: "text/plain",
+			}, true
+		}
+	}
+	return cmdlog.S3Logger{}, false
+}
 
 //////////////////////////////
 // GitHub //
@@ -78,24 +133,10 @@ type JobDef struct {
 	Script []string
 }
 
-func runJob(jobConf string, req GitHubCommitReq) []byte {
-
-	repoName := req.Repository.Name
-
-	data, err := ioutil.ReadFile(jobConf)
-	if err != nil {
-		return logMsg(fmt.Sprint("ERROR Unable to read jobConf file:", jobConf, "-", err))
-	}
-
-	jobsByRepo := make(map[string]JobDef)
-	err = json.Unmarshal(data, &jobsByRepo)
-	if err != nil {
-		return logMsg(fmt.Sprint("ERROR Unable to decode JSON:", string(data), "-", err))
-	}
-
-	job, ok := jobsByRepo[repoName]
+func toCmd(config Config, repoName string) (*exec.Cmd, error) {
+	job, ok := config.Repositories[repoName]
 	if !ok {
-		return logMsg(fmt.Sprint("ERROR No JobDef for repository:", repoName))
+		return nil, fmt.Errorf("ERROR No config for repository: %s", repoName)
 	}
 
 	var cmd *exec.Cmd
@@ -107,7 +148,7 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 
 	switch len(job.Script) {
 	case 0:
-		return logMsg(fmt.Sprint("ERROR script not defined for repository: ", repoName, "-", job))
+		return nil, fmt.Errorf("ERROR script not defined for repository: %s - %s", repoName, job)
 	case 1:
 		cmd = exec.Command(path)
 	default:
@@ -118,20 +159,78 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 		cmd.Dir = job.Dir
 	}
 
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	return cmd, nil
+}
 
-	log.Println("Running job for repository:", repoName, "dir:", cmd.Dir, "script:", cmd.Path)
-	err = cmd.Run()
+func loadConfig(filename string) (Config, error) {
+	config := Config{}
 
-	var msg string
+	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		msg = fmt.Sprint("ERROR Executing script for repository:", repoName, "-", cmd.Path,
-			"-", err, " stdout: ", stdout.String(), " stderr: ", stderr.String())
+		return config, err
+	}
+
+	err = json.Unmarshal(data, &config)
+	if err != nil {
+		return config, err
+	}
+
+	return config, nil
+}
+
+func runJob(jobConf string, req GitHubCommitReq) []byte {
+
+	// Load config from JSON file
+	config, err := loadConfig(jobConf)
+	if err != nil {
+		return logMsg(fmt.Sprint("ERROR Unable to load config:", jobConf, " - ", err))
+	}
+
+	// Find config for GitHub repository
+	repoName := req.Repository.Name
+	job, ok := config.Repositories[repoName]
+	if !ok {
+		return logMsg(fmt.Sprint("ERROR No JobDef for repository:", repoName))
+	}
+
+	// Create exec.Cmd based on repo config
+	cmd, err := toCmd(config, repoName)
+	if err != nil {
+		return logMsg(fmt.Sprint("githook: Unable to create command:", err))
+	}
+
+	// Run command and time duration
+	log.Println("Running job for repository:", repoName, "dir:", cmd.Dir, "script:", cmd.Path)
+	result := cmdlog.Run(repoName, cmd)
+
+	// Check errors
+	sendEmail := config.Email.Always
+	var msg, subject string
+	if result.Error != nil {
+		msg = fmt.Sprint("ERROR Executing job for repository: ", repoName, "-", cmd.Path,
+			"-", result.Error, " stdout: ", string(result.Stdout), " stderr: ", string(result.Stderr))
+		subject = fmt.Sprintf("Build FAILED for: %s", repoName)
+		sendEmail = true
 	} else {
-		msg = fmt.Sprint("OK ran job for repository:", repoName, "-", job.Script)
+		msg = fmt.Sprint("OK ran job for repository: ", repoName, "-", job.Script)
+		subject = fmt.Sprintf("Build passed for: %s", repoName)
+	}
+
+	// Log result
+	s3logger, ok := config.S3Logger()
+	if ok {
+		err = s3logger.Log(result)
+		if err != nil {
+			log.Println("ERROR logging to S3: ", err)
+		} else if sendEmail {
+			smtpl, ok := config.SMTPLogger()
+			if ok {
+				err = smtpl.Log(result, subject, s3logger.URL(result))
+				if err != nil {
+					log.Println("ERROR sending email: ", err)
+				}
+			}
+		}
 	}
 
 	log.Println(msg)
