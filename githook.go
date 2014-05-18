@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"github.com/karalabe/iris-go"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"net/smtp"
 	"net/url"
 	"os"
@@ -36,6 +38,7 @@ type Config struct {
 	Repositories map[string]JobDef
 	Aws          AwsConf
 	Email        EmailConf
+	Log          bool
 }
 
 func (c Config) SMTPLogger() (cmdlog.SMTPLogger, bool) {
@@ -203,6 +206,12 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 	log.Println("Running job for repository:", repoName, "dir:", cmd.Dir, "script:", cmd.Path)
 	result := cmdlog.Run(repoName, cmd)
 
+	if config.Log {
+		log.Println("  Status:", result.ExitStr)
+		log.Println("  Stdout:", string(result.Stdout))
+		log.Println("  Stderr:", string(result.Stderr))
+	}
+
 	// Check errors
 	sendEmail := config.Email.Always
 	var msg, subject string
@@ -242,25 +251,46 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 func main() {
 
 	var relayPort int
-	var app string
+	var irisApp string
 	var jobConf string
+	var httpBind string
 
 	flag.IntVar(&relayPort, "r", 55555, "Port of Iris relay")
-	flag.StringVar(&app, "a", "githook", "Iris app name to register as")
+	flag.StringVar(&irisApp, "a", "", "Iris app name to register as")
 	flag.StringVar(&jobConf, "c", "githook.json", "Job config file (JSON)")
+	flag.StringVar(&httpBind, "h", "", "HTTP bind addr")
 	flag.Parse()
 
-	log.SetPrefix(app)
+	log.SetPrefix(irisApp)
+	ghHandler := &GithubHandler{jobConf}
 
-	conn, err := iris.Connect(relayPort, app, &GithubHandler{jobConf})
-	if err != nil {
-		log.Fatalf("connection failed: %v.", err)
+	if irisApp != "" {
+		conn, err := iris.Connect(relayPort, irisApp, ghHandler)
+		if err != nil {
+			log.Fatalf("connection failed: %v.", err)
+		}
+		defer conn.Close()
+		log.Println("Successfully started", irisApp, "using jobConf:", jobConf)
+
+		quit := make(chan os.Signal, 1)
+		signal.Notify(quit, os.Interrupt)
+		<-quit
+	} else {
+		http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+			buf := bytes.Buffer{}
+			_, err := buf.ReadFrom(req.Body)
+			if err != nil {
+				msg := fmt.Sprintf("ReadFrom failed: %v", err)
+				log.Println(msg)
+				w.Write([]byte(msg))
+			} else {
+				resp := ghHandler.HandleRequest(buf.Bytes())
+				w.Write(resp)
+			}
+		})
+
+		log.Println("githook listening on:", httpBind, "using jobConf:", jobConf)
+		log.Fatal(http.ListenAndServe(httpBind, nil))
 	}
-	defer conn.Close()
 
-	log.Println("Successfully started", app, "using jobConf:", jobConf)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	<-quit
 }
