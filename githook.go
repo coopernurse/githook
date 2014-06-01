@@ -204,47 +204,51 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 
 	// Run command and time duration
 	log.Println("Running job for repository:", repoName, "dir:", cmd.Dir, "script:", cmd.Path)
-	result := cmdlog.Run(repoName, cmd)
 
-	if config.Log {
-		log.Println("  Status:", result.ExitStr)
-		log.Println("  Stdout:", string(result.Stdout))
-		log.Println("  Stderr:", string(result.Stderr))
-	}
+	go func() {
+		result := cmdlog.Run(repoName, cmd)
 
-	// Check errors
-	sendEmail := config.Email.Always
-	var msg, subject string
-	if result.Error != nil {
-		msg = fmt.Sprint("ERROR Executing job for repository: ", repoName, "-", cmd.Path,
-			"-", result.Error, " stdout: ", string(result.Stdout), " stderr: ", string(result.Stderr))
-		subject = fmt.Sprintf("Build FAILED for: %s", repoName)
-		sendEmail = true
-	} else {
-		msg = fmt.Sprint("OK ran job for repository: ", repoName, "-", job.Script)
-		subject = fmt.Sprintf("Build passed for: %s", repoName)
-	}
-
-	// Log result
-	s3logger, ok := config.S3Logger()
-	if ok {
-		err = s3logger.Log(result)
-		if err != nil {
-			log.Println("ERROR logging to S3: ", err)
+		if config.Log {
+			log.Println("  Status:", result.ExitStr)
+			log.Println("  Stdout:", string(result.Stdout))
+			log.Println("  Stderr:", string(result.Stderr))
 		}
-	}
-	if sendEmail {
-		smtpl, ok := config.SMTPLogger()
+
+		// Check errors
+		sendEmail := config.Email.Always
+		var msg, subject string
+		if result.Error != nil {
+			msg = fmt.Sprint("ERROR Executing job for repository: ", repoName, "-", cmd.Path,
+				"-", result.Error, " stdout: ", string(result.Stdout), " stderr: ", string(result.Stderr))
+			subject = fmt.Sprintf("Build FAILED for: %s", repoName)
+			sendEmail = true
+		} else {
+			msg = fmt.Sprint("OK ran job for repository: ", repoName, "-", job.Script)
+			subject = fmt.Sprintf("Build passed for: %s", repoName)
+		}
+
+		// Log result
+		s3logger, ok := config.S3Logger()
 		if ok {
-			err = smtpl.Log(result, subject, s3logger.URL(result))
+			err = s3logger.Log(result)
 			if err != nil {
-				log.Println("ERROR sending email: ", err)
+				log.Println("ERROR logging to S3: ", err)
 			}
 		}
-	}
+		if sendEmail {
+			smtpl, ok := config.SMTPLogger()
+			if ok {
+				err = smtpl.Log(result, subject, s3logger.URL(result))
+				if err != nil {
+					log.Println("ERROR sending email: ", err)
+				}
+			}
+		}
 
-	log.Println(msg)
-	return []byte(msg)
+		log.Println(msg)
+	}()
+
+	return []byte("Running job for repository:" + repoName)
 }
 
 //////////////////////////////
