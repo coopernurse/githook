@@ -231,13 +231,14 @@ func runJob(jobConf string, req GitHubCommitReq) []byte {
 		err = s3logger.Log(result)
 		if err != nil {
 			log.Println("ERROR logging to S3: ", err)
-		} else if sendEmail {
-			smtpl, ok := config.SMTPLogger()
-			if ok {
-				err = smtpl.Log(result, subject, s3logger.URL(result))
-				if err != nil {
-					log.Println("ERROR sending email: ", err)
-				}
+		}
+	}
+	if sendEmail {
+		smtpl, ok := config.SMTPLogger()
+		if ok {
+			err = smtpl.Log(result, subject, s3logger.URL(result))
+			if err != nil {
+				log.Println("ERROR sending email: ", err)
 			}
 		}
 	}
