@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"github.com/coopernurse/cmdlog"
 	"github.com/crowdmob/goamz/s3"
-	"github.com/karalabe/iris-go"
+	"gopkg.in/project-iris/iris-go.v0"
 	"io/ioutil"
 	"log"
 	"net/http"
